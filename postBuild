@@ -1,0 +1,3 @@
+#!/bin/bash
+# Binder only: compile the NEURON mechanisms when the image is built
+nrnivmodl

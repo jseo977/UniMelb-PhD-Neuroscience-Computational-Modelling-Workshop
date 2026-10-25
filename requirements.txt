@@ -1,0 +1,7 @@
+neuron==9.0.2
+numpy
+scipy
+matplotlib
+ipympl
+plotly
+ipywidgets
