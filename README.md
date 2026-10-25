@@ -4,8 +4,8 @@ Hands-on introduction to NEURON in Python, using the retinal ganglion cell model
 
 ## Open the workshop
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/YOUR_USER/YOUR_REPO/blob/main/run_sheasbyfohlmeister1999_workshop.ipynb)
-[![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/YOUR_USER/YOUR_REPO/HEAD?urlpath=lab/tree/run_sheasbyfohlmeister1999_workshop.ipynb)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/jseo977/UniMelb-PhD-Neuroscience-Computational-Modelling-Workshop/blob/main/run_sheasbyfohlmeister1999_workshop.ipynb)
+[![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/jseo977/UniMelb-PhD-Neuroscience-Computational-Modelling-Workshop/HEAD?urlpath=lab/tree/run_sheasbyfohlmeister1999_workshop.ipynb)
 
 **Colab (recommended):** click the badge, sign in with a Google account, then run the **Setup** cells at the top
 (click **Run anyway** if Colab warns the notebook was not authored by Google).
