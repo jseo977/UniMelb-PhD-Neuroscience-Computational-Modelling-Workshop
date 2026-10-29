@@ -4,16 +4,13 @@ Helper functions for the UniMelb PhD Neuroscience computational modelling worksh
 
 Contents
   1. Single-compartment model (Activities 1–3)   build_soma_sc, run_soma_sc, find_spikes, spike_half_width
-  2. Running simulations                          run_from_rest, Recorder
-  3. Stimuli                                      iclamp, pulse_wave, extracellular, stop_extracellular,
-                                                  reset_stimuli, update_rx_3d
-  4. Spikes and thresholds                        spike_times, find_threshold, scan_threshold
-  5. Optional-extra exercises                     fires_with_pulse, second_pulse_fires,
-                                                  fires_extracellular, segments, point_above
-  6. Morphology                                   seg_xyz, dendrite_path_sites, plot_final_rgc_with_electrode
-  7. Interactive dashboard                        plot_interactive_dashboard
+  2. Running simulations and plotting            run_from_rest, make_figure
+  3. Full cell (Activities 4–5)                  load_rgc_model, update_rx_3d, plot_final_rgc_with_electrode,
+                                                 seg_xyz, dendrite_path_sites
+  4. Interactive dashboard                       plot_interactive_dashboard
 """
 import numpy as np
+import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from scipy.signal import find_peaks
@@ -103,7 +100,7 @@ def spike_half_width(t, v, i_pk, dvdt_thres=10.0):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 2. RUNNING SIMULATIONS
+# 2. RUNNING SIMULATIONS AND PLOTTING
 # ══════════════════════════════════════════════════════════════════════════════
 def run_from_rest(tstop, dt=0.025, v_init=-62.5):
     """Initialise every section at rest (calcium reset too) and run to tstop (ms)."""
@@ -117,289 +114,129 @@ def run_from_rest(tstop, dt=0.025, v_init=-62.5):
     h.continuerun(tstop)
 
 
-class Recorder:
-    """Records time and Vm at named segments.  rec = Recorder({'soma': h.soma(0.5), ...})
-    rec.run(tstop, dt) runs from rest and returns (t, {name: Vm}) as arrays."""
-    def __init__(self, sites):
-        self.t = h.Vector().record(h._ref_t)
-        self.v = {}
-        for name, seg in sites.items():
-            self.add(name, seg)
-
-    def add(self, name, seg):
-        self.v[name] = h.Vector().record(seg._ref_v)
-
-    def run(self, tstop, dt=0.025):
-        run_from_rest(tstop, dt)
-        return np.array(self.t), {k: np.array(x) for k, x in self.v.items()}
+def make_figure(nrows=1, ncols=1, close=True, **kwargs):
+    """plt.subplots(nrows, ncols, **kwargs) with the interactive toolbar moved to the right, so it
+    does not cover the axis labels. Closes earlier figures first unless close=False (use that for
+    a second figure in the same cell). Returns (fig, axes)."""
+    if close:
+        plt.close('all')
+    fig, axes = plt.subplots(nrows, ncols, **kwargs)
+    try:
+        fig.canvas.toolbar_position = 'right'   # only exists for interactive (widget) figures
+        fig.canvas.header_visible = False
+    except Exception:
+        pass
+    return fig, axes
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 3. STIMULI
+# 3. FULL CELL: MODEL, ELECTRODE AND MORPHOLOGY
 # ══════════════════════════════════════════════════════════════════════════════
-def iclamp(seg, amp, delay, dur):
-    """A current clamp at seg: amp in nA, delay and dur in ms. Keep the returned object alive."""
-    c = h.IClamp(seg)
-    c.amp, c.delay, c.dur = amp, delay, dur
-    return c
+def load_rgc_model(morph_dir="neuron_morphology"):
+    """Load the Sheasby & Fohlmeister (1999) RGC (ctt3219b) from morph_dir, flip it so the soma faces
+    up, centre it on the soma, and insert the passive and extracellular (xtra) mechanisms.
+    Does nothing if the model is already loaded."""
+    if hasattr(h, 'soma'):
+        print("Model already loaded.")
+        return
+    h.load_file(f"{morph_dir}/neuron_morphology_ctt3219b.asc")
+    h.load_file(f"{morph_dir}/neuron_morphology_ctt3219b.hoc")
+
+    def points(sec):
+        return [(h.x3d(i, sec=sec), h.y3d(i, sec=sec), h.z3d(i, sec=sec), h.diam3d(i, sec=sec))
+                for i in range(int(h.n3d(sec=sec)))]
+
+    # Reverse the z coordinates to flip the morphology (soma facing up)
+    for sec in h.allsec():
+        pts = points(sec)
+        if len(pts) < 2:
+            continue
+        sec.pt3dclear()
+        for x, y, z, d in pts:
+            sec.pt3dadd(x, y, -z, d)
+    h.define_shape()
+
+    # Centre the cell on the soma, and insert the mechanisms
+    cx, cy, cz = np.mean([p[:3] for p in points(h.soma)], axis=0)
+    for sec in h.allsec():
+        sec.insert('extracellular')                    # extracellular field ...
+        sec.insert('xtra')                             # ... from a point electrode (xtra.mod)
+        sec.insert('pas')
+        pts = points(sec)
+        if len(pts) < 2:
+            continue
+        sec.pt3dclear()
+        for x, y, z, d in pts:
+            sec.pt3dadd(x - cx, y - cy, z - cz, d)
+        for seg in sec:                                # connect xtra to the extracellular mechanism
+            h.setpointer(seg._ref_e_extracellular, 'ex', seg.xtra)
+            h.setpointer(seg._ref_i_membrane, 'im', seg.xtra)
+
+    h.ko0_k_ion = 5.0      # mM, extracellular K
+    h.ki0_k_ion = 145.0    # mM, intracellular K
+    h.define_shape()
 
 
-def pulse_wave(t_on, phase_dur, amp, shape, tstop, dt=0.025):
-    """Extracellular pulse waveform (µA): 'cathodic' (negative), 'anodal' (positive) or
-    'biphasic' (cathodic, then anodal of the same size and length)."""
-    t_w = np.arange(0, tstop + dt, dt)
-    i_w = np.zeros_like(t_w)
-    first = (t_w >= t_on) & (t_w < t_on + phase_dur)
-    second = (t_w >= t_on + phase_dur) & (t_w < t_on + 2 * phase_dur)
-    if shape == 'cathodic':
-        i_w[first] = -amp
-    elif shape == 'anodal':
-        i_w[first] = amp
-    elif shape == 'biphasic':
-        i_w[first], i_w[second] = -amp, amp
-    else:
-        raise ValueError("shape must be 'cathodic', 'anodal' or 'biphasic'")
-    return t_w, i_w
-
-
-_XSTIM = {}                                    # keeps the extracellular stimulus vectors alive
-
-
-def extracellular(t_wave, i_wave):
-    """Play a current waveform (µA; negative = cathodic) through the extracellular electrode."""
-    stop_extracellular()
-    _XSTIM['t'], _XSTIM['i'] = h.Vector(t_wave), h.Vector(i_wave)
-    _XSTIM['i'].play(h._ref_is_xtra, _XSTIM['t'])
-
-
-def stop_extracellular():
-    """Stop any extracellular stimulus started with extracellular()."""
-    if 'i' in _XSTIM:
-        _XSTIM['i'].play_remove()
-    _XSTIM.clear()
-    h.is_xtra = 0
-
-
-def reset_stimuli(el_home):
-    """Stop extracellular stimulation, set every current clamp in the model to 0 nA, and put
-    the electrode back at el_home = (x, y, z) µm. (Re-run Activity 4's stimulus cell to
-    restore its clamp.)"""
-    stop_extracellular()
-    for clamp in h.List('IClamp'):
-        clamp.amp = 0
-    update_rx_3d(*el_home)
-
-
-def update_rx_3d(el_x, el_y, el_z):
-    """
-    Calculates transfer resistance (rx) for every segment.
-    Uses segment position relative to 3D points for accuracy.
-    """
-    rho = 100e4#80e4#100e4 #300e4 # ohm-um
-    
+def update_rx_3d(el_x, el_y, el_z, rho=100e4):
+    """Place a point electrode at (el_x, el_y, el_z) µm: set each segment's transfer resistance
+    (xtra.rx, MΩ) for a point source in a uniform medium of resistivity rho (Ω·µm)."""
     for sec in h.allsec():
         n3d = int(h.n3d(sec=sec))
-        if n3d < 2: continue # Skip if no 3D data
-        
-        # Get total 3D length to allow interpolation
+        if n3d < 2:
+            continue                                   # no 3D points
         L3d = h.arc3d(n3d - 1, sec=sec)
-        
         for seg in sec:
-            # Find the distance along the section for this segment center (0 to L)
-            target_arc = seg.x * L3d
-            
-            # Find the 3D point nearest to this arc length
-            # For a 2-point axon, this safely picks the right spot
-            x, y, z = 0, 0, 0
-            for i in range(n3d):
-                if h.arc3d(i, sec=sec) >= target_arc:
-                    x = h.x3d(i, sec=sec)
-                    y = h.y3d(i, sec=sec)
-                    z = h.z3d(i, sec=sec)
-                    break
-            
-            # Calculate distance to electrode
-            r = np.sqrt((x - el_x)**2 + (y - el_y)**2 + (z - el_z)**2)
-            if r < 1: r = 1 # Avoid singularity
-            
-            # Assign rx in MOhm
-            seg.xtra.rx = (rho / (4 * np.pi * r)) * 1e-6
+            # first 3D point at or beyond the segment's centre
+            i = next(k for k in range(n3d) if h.arc3d(k, sec=sec) >= seg.x * L3d)
+            x, y, z = h.x3d(i, sec=sec), h.y3d(i, sec=sec), h.z3d(i, sec=sec)
+            r = max(np.sqrt((x - el_x)**2 + (y - el_y)**2 + (z - el_z)**2), 1.0)   # µm, avoid r = 0
+            seg.xtra.rx = rho / (4 * np.pi * r) * 1e-6     # Ω -> MΩ
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 4. SPIKES AND THRESHOLDS
-# ══════════════════════════════════════════════════════════════════════════════
-def spike_times(t, v, t_from=0.0, t_to=np.inf, height=PEAK_HEIGHT):
-    """Times (ms) of spike peaks above height, between t_from and t_to."""
-    p, _ = find_peaks(v, height=height)
-    tp = t[p]
-    return tp[(tp >= t_from) & (tp <= t_to)]
-
-
-def find_threshold(fires, lo, hi, rel_tol=0.02):
-    """Smallest amplitude between lo and hi for which fires(amp) is True, to within rel_tol
-    (geometric bisection). Returns nan if hi does not fire, lo if lo already fires."""
-    if not fires(hi):
-        return np.nan
-    if fires(lo):
-        return lo
-    while hi / lo > 1 + rel_tol:
-        mid = np.sqrt(lo * hi)
-        if fires(mid):
-            hi = mid
-        else:
-            lo = mid
-    return hi
-
-
-def scan_threshold(fires, amps, rel_tol=0.02):
-    """Like find_threshold, but first steps up through amps (ascending) to the first that fires.
-    Use when a response can fail again at higher amplitudes (e.g. extracellular block)."""
-    prev = None
-    for a in amps:
-        if fires(a):
-            return a if prev is None else find_threshold(fires, prev, a, rel_tol)
-        prev = a
-    return np.nan
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 5. OPTIONAL-EXTRA EXERCISES
-# ══════════════════════════════════════════════════════════════════════════════
-def fires_with_pulse(rec, amp, dur, site='soma', t_on=5, after=15, key='soma', dt=0.025):
-    """Does one pulse fire a spike at rec's site `key`?  site='soma': current clamp at the soma
-    (amp in nA); site='electrode': cathodic pulse from the extracellular electrode (amp in µA)."""
-    tstop = t_on + dur + after
-    clamp = None
-    if site == 'soma':
-        clamp = iclamp(h.soma(0.5), amp, t_on, dur)
-    elif site == 'electrode':
-        extracellular(*pulse_wave(t_on, dur, amp, 'cathodic', tstop, dt))
-    else:
-        raise ValueError("site must be 'soma' or 'electrode'")
-    t, v = rec.run(tstop, dt)
-    stop_extracellular()
-    del clamp
-    return len(spike_times(t, v[key], t_on)) > 0
-
-
-def second_pulse_fires(rec, amp1, amp2, interval, first_spike, pulse=0.5, t1=5, after=20, dt=0.025):
-    """Two current pulses at the soma (nA), interval ms apart: does the second one fire a spike
-    of its own (after both the second pulse and the first spike, at first_spike ms)?"""
-    c1 = iclamp(h.soma(0.5), amp1, t1, pulse)
-    c2 = iclamp(h.soma(0.5), amp2, t1 + interval, pulse)
-    t, v = rec.run(t1 + interval + after, dt)
-    del c1, c2
-    return len(spike_times(t, v['soma'], max(t1 + interval, first_spike + 0.5))) > 0
-
-
-def fires_extracellular(rec, amp, shape, phase_dur=0.5, t_on=5, after=20, key='axon_far', dt=0.025):
-    """Does an extracellular pulse (amp in µA, shape as in pulse_wave) send a spike to rec's site `key`?"""
-    tstop = t_on + after
-    extracellular(*pulse_wave(t_on, phase_dur, amp, shape, tstop, dt))
-    t, v = rec.run(tstop, dt)
-    stop_extracellular()
-    return len(spike_times(t, v[key], t_on)) > 0
-
-
-def segments(where='all'):
-    """All segments in the cell ('all'), or in the sections whose names start with where (e.g. 'dend')."""
-    secs = list(h.allsec()) if where == 'all' else [s for s in h.allsec() if s.name().startswith(where)]
-    return [seg for sec in secs for seg in sec]
-
-
-def point_above(seg, height):
-    """(x, y, z) µm of the point height µm above seg, e.g. to place the electrode over it."""
-    x, y, z = seg_xyz(seg)
-    return (x, y, z + height)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 6. MORPHOLOGY
-# ══════════════════════════════════════════════════════════════════════════════
 def plot_final_rgc_with_electrode(el_x, el_y, el_z):
+    """3D plot of the cell (soma, AIS, axon, dendrites) and the electrode at (el_x, el_y, el_z) µm."""
+    colours = {'Soma': '#000000', 'AIS': '#e67e22', 'Axon': '#1baf7a', 'Dendrites': '#2a78d6'}
+    widths = {'Soma': 6, 'AIS': 5, 'Axon': 3, 'Dendrites': 1.5}
     fig = go.Figure()
-
-    colors = {
-        'soma': "#777809",
-        'ais': "#023708",   # Hot Pink
-        'axon': "#6f3730",  # Red
-        'dend': '#2980b9',  # Blue
-        'elec': '#f1c40f'   # Gold
-    }
-
-    # Track which labels we've already added to the legend
-    added_to_legend = set()
-
+    shown = set()                                      # one legend entry per part of the cell
     for sec in h.allsec():
         n3d = int(h.n3d(sec=sec))
-        if n3d < 2: continue
-        
-        x = [h.x3d(i, sec=sec) for i in range(n3d)]
-        y = [h.y3d(i, sec=sec) for i in range(n3d)]
-        z = [h.z3d(i, sec=sec) for i in range(n3d)]
-        
+        if n3d < 2:
+            continue
         name = sec.name().lower()
-        
-        # Determine classification
         if 'soma' in name:
-            label, col, lw = 'Soma', colors['soma'], 6
-        elif any(k in name for k in ['init', 'narrow', 'initseg']):
-            label, col, lw = 'AIS', colors['ais'], 5
+            label = 'Soma'
+        elif any(k in name for k in ('init', 'narrow')):
+            label = 'AIS'
         elif 'axon' in name:
-            label, col, lw = 'Axon', colors['axon'], 3
+            label = 'Axon'
         else:
-            label, col, lw = 'Dendrites', colors['dend'], 1.5
-
-        # Only show the legend entry if it's the first time we've seen this label
-        show_leg = False
-        if label not in added_to_legend:
-            show_leg = True
-            added_to_legend.add(label)
-
+            label = 'Dendrites'
         fig.add_trace(go.Scatter3d(
-            x=x, y=y, z=z,
-            mode='lines',
-            line=dict(color=col, width=lw),
-            name=label,
-            legendgroup=label, # Grouping ensures clicking one toggles all
-            showlegend=show_leg,
-            hoverinfo='name'
-        ))
+            x=[h.x3d(i, sec=sec) for i in range(n3d)],
+            y=[h.y3d(i, sec=sec) for i in range(n3d)],
+            z=[h.z3d(i, sec=sec) for i in range(n3d)],
+            mode='lines', line=dict(color=colours[label], width=widths[label]),
+            name=label, legendgroup=label, showlegend=label not in shown, hoverinfo='name'))
+        shown.add(label)
 
-    # Plot Electrode
+    fig.add_trace(go.Scatter3d(                        # electrode, with a line down to the cell
+        x=[el_x], y=[el_y], z=[el_z], mode='markers', name='Electrode',
+        marker=dict(symbol='diamond', size=10, color='#f1c40f', line=dict(width=2, color='black'))))
     fig.add_trace(go.Scatter3d(
-        x=[el_x], y=[el_y], z=[el_z],
-        mode='markers',
-        marker=dict(symbol='diamond', size=10, color=colors['elec'], 
-                    line=dict(width=2, color='black')),
-        name='Electrode'
-    ))
-
-    # Electrode Drop Line
-    fig.add_trace(go.Scatter3d(
-        x=[el_x, el_x], y=[el_y, el_y], z=[min(0, el_z-50), el_z],
-        mode='lines',
-        line=dict(color='black', width=2, dash='dash'),
-        showlegend=False,
-        hoverinfo='none'
-    ))
+        x=[el_x, el_x], y=[el_y, el_y], z=[min(0, el_z - 50), el_z], mode='lines',
+        line=dict(color='black', width=2, dash='dash'), showlegend=False, hoverinfo='none'))
 
     fig.update_layout(
-        title="RGC Morphology with Electrode",
-        scene=dict(
-            xaxis=dict(title='X (μm)', range=[-250, 250]),
-            yaxis=dict(title='Y (μm)', range=[-250, 250]),
-            zaxis=dict(title='Z (μm)', range=[-75, 75]),
-            aspectmode='manual',
-            aspectratio=dict(x=1, y=1, z=0.5)
-        ),
-        legend=dict(itemsizing='constant'), # Makes legend lines easier to see
-        margin=dict(l=0, r=0, b=0, t=40)
-    )
-
+        title="RGC morphology with electrode",
+        scene=dict(xaxis=dict(title='X (µm)', range=[-250, 250]),
+                   yaxis=dict(title='Y (µm)', range=[-250, 250]),
+                   zaxis=dict(title='Z (µm)', range=[-75, 75]),
+                   aspectmode='manual', aspectratio=dict(x=1, y=1, z=0.5)),
+        legend=dict(itemsizing='constant'),
+        margin=dict(l=0, r=0, b=0, t=40))
     fig.show()
-    fig.write_html("RGC_Morphology_with_Electrode.html", include_plotlyjs='cdn')
+    return fig
 
 
 def seg_xyz(seg):
