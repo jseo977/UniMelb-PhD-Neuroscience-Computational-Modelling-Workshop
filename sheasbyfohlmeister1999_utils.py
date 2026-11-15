@@ -7,7 +7,7 @@ defined in the notebook itself, so students can see how a NEURON simulation is s
 
 Contents
   1. Spikes                                      find_spikes, spike_half_width
-  2. Plotting                                    make_figure, plot_hh_panels
+  2. Plotting (interactive, Plotly)             plot_hh_panels
   3. Full cell: model and morphology             load_rgc_model, update_rx_3d, plot_final_rgc_with_electrode,
                                                  seg_xyz, record_segments, dendrite_path_sites,
                                                  spike_origin, furthest_in_view
@@ -61,26 +61,34 @@ def spike_half_width(t, v, i_pk, dvdt_thres=10.0):
 # ══════════════════════════════════════════════════════════════════════════════
 # 2. PLOTTING
 # ══════════════════════════════════════════════════════════════════════════════
-def make_figure(nrows=1, ncols=1, close=True, **kwargs):
-    """plt.subplots(nrows, ncols, **kwargs) with the interactive toolbar moved to the right, so it
-    does not cover the axis labels. Closes earlier figures first unless close=False (use that for
-    a second figure in the same cell). Returns (fig, axes)."""
-    if close:
-        plt.close('all')
-    fig, axes = plt.subplots(nrows, ncols, **kwargs)
-    try:
-        fig.canvas.toolbar_position = 'right'   # only exists for interactive (widget) figures
-        fig.canvas.header_visible = False
-    except Exception:
-        pass
-    return fig, axes
+def _decimate(t, y, max_points=4000):
+    """Fewer points for plotting, keeping each bin's minimum and maximum so spike peaks and
+    troughs are not lost. Interactive figures stay responsive even for long runs."""
+    t, y = np.asarray(t, dtype=float), np.asarray(y, dtype=float)
+    if len(t) <= max_points:
+        return t, y
+    k = int(np.ceil(len(t) / (max_points / 2)))
+    n = len(t) // k * k
+    blocks = y[:n].reshape(-1, k)
+    lo = blocks.argmin(axis=1) + np.arange(0, n, k)
+    hi = blocks.argmax(axis=1) + np.arange(0, n, k)
+    idx = np.unique(np.concatenate([lo, hi, [0, len(t) - 1], np.arange(n, len(t))]))
+    return t[idx], y[idx]
+
+
+def _line(t, y, name, colour, legend, width=1.4, dash=None):
+    td, yd = _decimate(t, y)
+    return go.Scatter(x=td, y=yd, name=name, mode='lines', legend=legend,
+                      line=dict(color=mcolors.to_hex(colour), width=width, dash=dash),   # accepts matplotlib colours ('k')
+                      hovertemplate=f'{name}: %{{y:.2f}}<extra></extra>')
 
 
 def plot_hh_panels(t, i_stim, v_traces, m, h_gate, n, gnabar, gkbar, extra_panels=(),
-                   title=None, stim_label='IClamp (pA)'):
+                   title=None, stim_label='IClamp (pA)', row_height=150):
     """
     The standard figure for every activity, all on one time axis: the injected current, Vm,
-    the gating variables (m, h, n) and the Na⁺ and K⁺ conductances.
+    the gating variables (m, h, n) and the Na⁺ and K⁺ conductances. Interactive (Plotly): drag
+    to zoom (zooming one panel zooms them all in time), double-click to reset, hover to read values.
 
     t, i_stim    : time (ms) and injected current (pA)
     v_traces     : Vm traces for the Vm panel: [(label, Vm, colour), ...]
@@ -88,34 +96,57 @@ def plot_hh_panels(t, i_stim, v_traces, m, h_gate, n, gnabar, gkbar, extra_panel
     gnabar, gkbar: maximal conductances there (S/cm²), so gNa = gnabar·m³h and gK = gkbar·n⁴
     extra_panels : more Vm panels below the first, e.g. along the dendrite and the axon:
                    [(y label, [(label, Vm, colour), ...]), ...]
+    row_height   : height (px) of each full-height panel; the current panel is half that
     """
     t, m, h_gate, n = (np.asarray(x, dtype=float) for x in (t, m, h_gate, n))
-    n_rows = 4 + len(extra_panels)
-    fig, axes = make_figure(n_rows, 1, figsize=(9.5, 2 + 1.8 * n_rows), sharex=True,
-                            gridspec_kw={'height_ratios': [1] + [2] * (n_rows - 1)})
-    axes[0].plot(t, np.asarray(i_stim, dtype=float), color='k')
-    axes[0].set_ylabel(stim_label)
-    for ax, (ylabel, traces) in zip(axes[1:], [('Vm (mV)', v_traces)] + list(extra_panels)):
+    vm_panels = [('Vm (mV)', v_traces)] + list(extra_panels)
+    n_rows = 3 + len(vm_panels)
+    heights = [0.5] + [1] * (n_rows - 1)
+    fig = make_subplots(rows=n_rows, cols=1, shared_xaxes=True, vertical_spacing=0.025,
+                        row_heights=heights)
+    legend_rows = {}                                    # one legend beside each panel that needs one
+
+    def legend_for(row):
+        legend_rows.setdefault(row, f"legend{'' if not legend_rows else len(legend_rows) + 1}")
+        return legend_rows[row]
+
+    fig.add_trace(_line(t, i_stim, 'Current', 'black', 'legend', width=1.6), row=1, col=1)
+    fig.update_yaxes(title_text=stim_label, row=1, col=1)
+    for r, (ylabel, traces) in enumerate(vm_panels, start=2):
+        lg = legend_for(r) if len(traces) > 1 else None
         for label, v, colour in traces:
-            ax.plot(t, np.asarray(v, dtype=float), color=colour, lw=1.2, label=label)
-        ax.set_ylabel(ylabel)
-        if len(traces) > 1:
-            ax.legend(loc='upper left', bbox_to_anchor=(1.01, 1), fontsize=8)
-    ax_gate, ax_g = axes[-2], axes[-1]
-    ax_gate.plot(t, m, label='m (Na act.)', color=GATE_COLOURS['m'])
-    ax_gate.plot(t, h_gate, label='h (Na inact.)', color=GATE_COLOURS['h'])
-    ax_gate.plot(t, n, label='n (K act.)', color=GATE_COLOURS['n'])
-    ax_gate.set_ylabel('Gate')
-    ax_gate.legend(loc='upper left', bbox_to_anchor=(1.01, 1), fontsize=8)
-    ax_g.plot(t, gnabar * m**3 * h_gate * 1000, label='gNa', color=GATE_COLOURS['m'])     # mS/cm²
-    ax_g.plot(t, gkbar * n**4 * 1000, label='gK (delayed rect.)', color=GATE_COLOURS['n'])
-    ax_g.set_ylabel('g (mS/cm²)')
-    ax_g.set_xlabel('Time (ms)')
-    ax_g.legend(loc='upper left', bbox_to_anchor=(1.01, 1), fontsize=8)
-    if title:
-        axes[0].set_title(title)
-    plt.tight_layout()
-    plt.show()
+            fig.add_trace(_line(t, v, label, colour, lg or 'legend'), row=r, col=1)
+            fig.data[-1].showlegend = lg is not None
+        fig.update_yaxes(title_text=ylabel, row=r, col=1)
+    r_gate, r_g = n_rows - 1, n_rows
+    lg = legend_for(r_gate)
+    for k, lab, y in (('m', 'm (Na act.)', m), ('h', 'h (Na inact.)', h_gate), ('n', 'n (K act.)', n)):
+        fig.add_trace(_line(t, y, lab, GATE_COLOURS[k], lg), row=r_gate, col=1)
+    fig.update_yaxes(title_text='Gate', range=[-0.03, 1.03], row=r_gate, col=1)
+    lg = legend_for(r_g)
+    fig.add_trace(_line(t, gnabar * m**3 * h_gate * 1000, 'gNa', GATE_COLOURS['m'], lg), row=r_g, col=1)
+    fig.add_trace(_line(t, gkbar * n**4 * 1000, 'gK (delayed rect.)', GATE_COLOURS['n'], lg), row=r_g, col=1)
+    fig.update_yaxes(title_text='g (mS/cm²)', row=r_g, col=1)
+    fig.update_xaxes(title_text='Time (ms)', row=r_g, col=1)
+    fig.data[0].showlegend = False
+
+    # Place each legend beside its own panel
+    total = sum(heights)
+    layout_legends = {}
+    for row, name in legend_rows.items():
+        dom = fig.layout[f"yaxis{'' if row == 1 else row}"].domain
+        layout_legends[name] = dict(x=1.01, xanchor='left', y=dom[1], yanchor='top',
+                                    font=dict(size=11), bgcolor='rgba(255,255,255,0.8)')
+    fig.update_layout(**layout_legends)
+    fig.update_layout(
+        title=dict(text=title or '', x=0.01, xanchor='left', font=dict(size=15)),
+        template='plotly_white', height=int(row_height * total + 110),
+        margin=dict(l=70, r=170, t=50 if title else 20, b=50),
+        hovermode='x unified', dragmode='zoom')
+    fig.update_xaxes(showspikes=True, spikemode='across', spikethickness=1, spikecolor='#999',
+                     spikedash='dot')
+    fig.show(config={'displaylogo': False, 'scrollZoom': False,
+                     'modeBarButtonsToRemove': ['select2d', 'lasso2d', 'autoScale2d']})
     return fig
 
 
@@ -706,6 +737,9 @@ def report_conductances(r, sec, delay):
 # ══════════════════════════════════════════════════════════════════════════════
 # 6. ACTIVITIES 4–5: FULL CELL
 # ══════════════════════════════════════════════════════════════════════════════
+AXON_DIAM_DEFAULT = 1.0       # µm : the model's axon
+_CV_1UM = {}                  # conduction velocity of the 1 µm axon, for the √diameter prediction
+
 def setup_rgc(morph_dir="neuron_morphology", electrode=(0, 0, 25), plot_electrode=False, view_um=140):
     """
     Load the full cell (once), place a current clamp in the soma, and set up the recordings:
@@ -844,22 +878,23 @@ def conduction_velocity(res):
     if np.all(np.isnan(times)):
         print("No action potential: raise PULSE_AMP and PULSE_DUR above threshold.")
         return
-    fig, ax = make_figure(figsize=(7, 4.5))
+    fig = go.Figure()
     for (l, v, d), tp in zip(sites, times):
         if np.isfinite(tp):
-            ax.plot(d / 1000, tp - res['delay'], 'o', ms=9, color=col[l], mec='k', mew=0.5, label=l)
+            fig.add_trace(go.Scatter(x=[d / 1000], y=[tp - res['delay']], mode='markers', name=l,
+                                     marker=dict(size=12, color=col[l], line=dict(color='black', width=1)),
+                                     hovertemplate=f'{l}: %{{x:.2f}} mm, %{{y:.2f}} ms<extra></extra>'))
     pts = np.array([(d, tp) for (l, v, d), tp in zip(sites, times) if l.startswith('Axon') and np.isfinite(tp)])
     cv = None
     if len(pts) >= 2:
         slope, icpt = np.polyfit(pts[:, 0], pts[:, 1] - res['delay'], 1)    # ms per µm
         cv = 1 / slope / 1000                                               # µm/ms -> m/s
         xs = np.array([0, pts[:, 0].max()])
-        ax.plot(xs / 1000, slope * xs + icpt, '--', color='grey', lw=1, label=f'fit: {cv:.2f} m/s')
-    ax.set_xlabel('Distance from soma (mm)')
-    ax.set_ylabel('Time of spike peak after pulse onset (ms)')
-    ax.legend(fontsize=8)
-    plt.tight_layout()
-    plt.show()
+        fig.add_trace(go.Scatter(x=xs / 1000, y=slope * xs + icpt, mode='lines', name=f'fit: {cv:.2f} m/s',
+                                 line=dict(color='grey', dash='dash', width=1.5)))
+    fig.update_layout(template='plotly_white', height=420, margin=dict(l=70, r=20, t=30, b=50),
+                      xaxis_title='Distance from soma (mm)', yaxis_title='Time of spike peak after pulse onset (ms)')
+    fig.show(config={'displaylogo': False})
     for (l, v, d), tp in zip(sites, times):
         print(f"{l:>14s}: {d:6.0f} µm, " + ("no spike" if np.isnan(tp) else
                                             f"peaks {tp - res['delay']:6.2f} ms after the pulse starts"))
