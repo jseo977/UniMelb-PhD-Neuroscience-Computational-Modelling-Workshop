@@ -706,11 +706,6 @@ def report_conductances(r, sec, delay):
 # ══════════════════════════════════════════════════════════════════════════════
 # 6. ACTIVITIES 4–5: FULL CELL
 # ══════════════════════════════════════════════════════════════════════════════
-DT_FULL_CELL = 0.005          # ms : time step for the full cell (fixed)
-AXON_DIAM_DEFAULT = 1.0       # µm : the model's axon
-_CV_1UM = {}                  # conduction velocity of the 1 µm axon, for the √diameter prediction
-
-
 def setup_rgc(morph_dir="neuron_morphology", electrode=(0, 0, 25), plot_electrode=False, view_um=140):
     """
     Load the full cell (once), place a current clamp in the soma, and set up the recordings:
