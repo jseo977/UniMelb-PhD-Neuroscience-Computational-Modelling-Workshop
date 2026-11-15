@@ -415,7 +415,7 @@ def _default_site_colours(labels):
 def plot_interactive_dashboard(t, v_recorders, sites, panels=None, gates=None, protocol=(),
                                frame_ms=5.0, v_range=None, view_um=None, view_centre=(0, 0, 0),
                                seg_recorders=None, t_window=None, frame_delay=40, colour_gamma=1.0,
-                               mark_soma=False,
+                               mark_soma=False, electrode=None,
                                title="Interactive dashboard", panel_height=150,
                                show_fig=True, save_html=None):
     """
@@ -441,6 +441,8 @@ def plot_interactive_dashboard(t, v_recorders, sites, panels=None, gates=None, p
                    These sections are coloured segment by segment (instead of by their middle),
                    so a spike can be seen moving along them.
     mark_soma    : True to also draw the marker of a site in the soma (above the soma)
+    electrode    : optional (x, y, z) µm of a stimulating electrode, drawn as a yellow diamond at its
+                   (x, y), just above the cell (left out if it is outside the 3D view)
     colour_gamma : 1 = a linear colour scale. Larger values (e.g. 3) spend more of the colours
                    near the top of the scale, so the action potential's peak stands out from
                    Vm values a few tens of mV below it.
@@ -544,6 +546,7 @@ def plot_interactive_dashboard(t, v_recorders, sites, panels=None, gates=None, p
         lo, hi = pts.min(axis=0), pts.max(axis=0)
         pad = 0.08 * (hi - lo).max()
         ranges = [[float(a - pad), float(b + pad)] for a, b in zip(lo, hi)]
+    el_in_view = electrode is not None and all(ranges[i][0] <= electrode[i] <= ranges[i][1] for i in (0, 1))
     spans = np.array([r[1] - r[0] for r in ranges])
     aspect = dict(zip('xyz', (spans / spans.max()).tolist()))
 
@@ -598,6 +601,16 @@ def plot_interactive_dashboard(t, v_recorders, sites, panels=None, gates=None, p
             fig.add_trace(go.Scatter3d(x=[x], y=[y], z=[z + 2], mode='markers', name=l, showlegend=False,
                                        marker=dict(size=7, color=info['colour'], symbol='diamond'),
                                        hovertext=[l], hoverinfo='text'), row=1, col=1)
+
+    if el_in_view:      # stimulating electrode: drawn at its (x, y), just above the cell (seen from above,
+        ex, ey, ez = electrode                    # a marker at its true height would look displaced)
+        over_soma = np.hypot(ex, ey) < max(h.soma.L, h.soma.diam) / 2 + 2     # the cell is centred on the soma
+        z_top = min(ranges[2][1], h.soma.diam / 2 + 4 if over_soma else 3)   # on top of the soma, or level with the cell
+        fig.add_trace(go.Scatter3d(x=[ex], y=[ey], z=[z_top], mode='markers', name='Electrode', showlegend=False,
+                                   marker=dict(symbol='diamond', size=9, color='#f1c40f',
+                                               line=dict(width=2, color='black')),
+                                   hovertext=[f'Electrode ({ex:g}, {ey:g}) µm, {ez:.0f} µm above the soma centre'],
+                                   hoverinfo='text'), row=1, col=1)
 
     # --- Animated traces: 3D cell, time markers, status text ------------------
     start_anim = len(fig.data)
@@ -755,13 +768,18 @@ def setup_rgc(morph_dir="neuron_morphology", electrode=(0, 0, 25), plot_electrod
         load_rgc_model(morph_dir)
     el = (electrode[0], electrode[1], electrode[2] + h.soma.diam / 2 + 1)   # +1 µm: inner limiting membrane
     update_rx_3d(*el)
-    if plot_electrode:
+    if plot_electrode:                               # widen the view if the electrode is outside it
+        view_um = max(view_um, abs(electrode[0]) + 40, abs(electrode[1]) + 40)
         plot_final_rgc_with_electrode(*el, view_um=view_um)
 
     soma = h.soma(0.5)
     dend_sites = [(f'Dendrite {d:.0f} µm', seg, d) for seg, d in dendrite_path_sites((0.25, 0.55, 0.9))]
-    axon_sites = [(f'Axon {h.distance(soma, h.axon(x)) / 1000:.1f} mm', h.axon(x), h.distance(soma, h.axon(x)))
-                  for x in (0.1, 0.5, 0.9)]
+    # Axon sites every 1 mm from the centre of the soma (1, 2, 3, 4 and 5 mm)
+    d0, L = h.distance(soma, h.axon(0)), h.axon.L
+    axon_sites = []
+    for mm in range(1, int((d0 + L) // 1000) + 1):
+        seg = h.axon((mm * 1000 - d0) / L)
+        axon_sites.append((f'Axon {mm} mm', seg, h.distance(soma, seg)))
     axon_max = h.distance(soma, h.axon(1))
     colours = {'Soma': '#000000', 'AIS': '#e67e22'}
     colours.update({l: mcolors.to_hex(plt.cm.Blues(0.3 + 0.7 * d / 200)) for l, seg, d in dend_sites})
@@ -770,7 +788,7 @@ def setup_rgc(morph_dir="neuron_morphology", electrode=(0, 0, 25), plot_electrod
     clamp = h.IClamp(soma)
     rec = lambda ref: h.Vector().record(ref)
     return dict(
-        clamp=clamp, dend_sites=dend_sites, axon_sites=axon_sites, colours=colours,
+        clamp=clamp, electrode=tuple(electrode), dend_sites=dend_sites, axon_sites=axon_sites, colours=colours,
         t=rec(h._ref_t), i=rec(clamp._ref_i),
         soma=rec(soma._ref_v), ais=rec(h.initseg(0.5)._ref_v),
         dend={l: rec(seg._ref_v) for l, seg, d in dend_sites},
@@ -786,20 +804,41 @@ def _first_peak(t, v, after=-np.inf):
     return int(pk[0]) if len(pk) else None
 
 
+def _stim(res):
+    """(axis label, protocol name, description) of the stimulus: the somatic current clamp
+    (run_rgc) or, when res says so, the extracellular electrode (run_rgc_extracellular)."""
+    return (res.get('stim_label', 'IClamp (pA)'), res.get('stim_name', 'IClamp'),
+            res.get('stim_desc', f"{res['amp']} pA for {res['dur']} ms into the soma"))
+
+
+def _axon_spiked(res):
+    return any(_first_peak(res['t'], v) is not None for v in res['axon'].values())
+
+
+def _electrode_xyz(res):
+    """(x, y, z) µm of the stimulating electrode for an extracellular run, else None."""
+    if res.get('stim_name') != 'Electrode':
+        return None
+    x, y, height = res['rgc']['electrode']
+    return (x, y, height + h.soma.diam / 2 + 1)            # as placed by setup_rgc
+
+
 def show_rgc(res):
     """Activity 4: the standard figure (current, Vm at soma and AIS, along the dendrite and the axon,
     gates and conductances at the soma), when the AIS and soma peak, and how far the spike spreads."""
     t, col = res['t'], res['rgc']['colours']
     g = res['rgc']['gates']
     i_soma = _first_peak(t, res['soma'])
-    print(f"{res['amp']} pA for {res['dur']} ms: "
-          + (f"ACTION POTENTIAL at the soma, t = {t[i_soma]:.2f} ms" if i_soma is not None else "no action potential"))
+    label, name, desc = _stim(res)
+    print(f"{desc}: "
+          + (f"ACTION POTENTIAL at the soma, t = {t[i_soma]:.2f} ms" if i_soma is not None else
+             "no action potential at the soma, but one in the axon" if _axon_spiked(res) else "no action potential"))
     grey = ('Soma', res['soma'], '#bbbbbb')
     plot_hh_panels(t, res['i'], [('Soma', res['soma'], col['Soma']), ('AIS', res['ais'], col['AIS'])],
                    g['m'], g['h'], g['n'], h.soma(0.5).gnabar_spike, h.soma(0.5).gkbar_spike,
                    extra_panels=[('Dendrite Vm (mV)', [grey] + [(l, v, col[l]) for l, v in res['dend'].items()]),
                                  ('Axon Vm (mV)', [grey] + [(l, v, col[l]) for l, v in res['axon'].items()])],
-                   title=f"{res['amp']} pA for {res['dur']} ms into the soma (gates and conductances at the soma)")
+                   title=f"{desc} (gates and conductances at the soma)", stim_label=label)
     i_ais = _first_peak(t, res['ais'])
     if i_soma is None or i_ais is None:
         return
@@ -832,9 +871,9 @@ def rgc_dashboard(res, frame_ms=0.2, frame_delay=40, colour_gamma=1):
         res['t'], rgc['all'], sites=sites,
         panels=[('Soma Vm', ['Soma']), ('AIS Vm', ['AIS']),
                 ('Dendrite Vm', list(res['dend'])), ('Axon Vm', list(res['axon']))],
-        gates=rgc['gates'], protocol=[('IClamp', res['delay'], res['delay'] + res['dur'], 'orange')],
+        gates=rgc['gates'], protocol=[(_stim(res)[1], res['delay'], res['delay'] + res['dur'], 'orange')],
         frame_ms=frame_ms, frame_delay=frame_delay, colour_gamma=colour_gamma,
-        title=f"Somatic current injection: {res['amp']} pA for {res['dur']} ms")
+        electrode=_electrode_xyz(res), title=_stim(res)[2])
 
 
 def rgc_zoom_dashboard(res, zoom_um=60, before_peak=0.8, after_peak=0.3, frame_ms=0.005,
@@ -845,24 +884,28 @@ def rgc_zoom_dashboard(res, zoom_um=60, before_peak=0.8, after_peak=0.3, frame_m
     t, rgc = res['t'], res['rgc']
     i_soma = _first_peak(t, res['soma'])
     if i_soma is None:
-        print("No spike at the soma, so there is nothing to zoom in on: raise PULSE_AMP above threshold.")
+        print("No spike at the soma, so there is nothing to zoom in on"
+              + (" (the axon fired, but the spike did not reach the soma)." if _axon_spiked(res)
+                 else ": raise PULSE_AMP above threshold."))
         return None
     soma = h.soma(0.5)
     centre = seg_xyz(h.initseg(0.7))
     origin_seg, origin_v = spike_origin(rgc['t'], rgc['segs'])
     edge_seg, edge_v = furthest_in_view(rgc['segs'], centre, zoom_um)
-    print(f"The spike starts in {origin_seg.sec.name()}, {h.distance(soma, origin_seg):.0f} µm from the centre "
+    print(f"Of the soma, AIS and thin segment, the spike peaks first in {origin_seg.sec.name()}, "
+          f"{h.distance(soma, origin_seg):.0f} µm from the centre "
           f"of the soma (the AIS runs from {h.distance(soma, h.initseg(0)):.0f} to "
           f"{h.distance(soma, h.initseg(1)):.0f} µm).")
     sites = [('Soma', soma, res['soma'], '#000000'),
-             (f'Spike starts ({h.distance(soma, origin_seg):.0f} µm)', origin_seg, origin_v, '#e67e22'),
+             (f'Peaks first ({h.distance(soma, origin_seg):.0f} µm)', origin_seg, origin_v, '#e67e22'),
              (f'Axon ({h.distance(soma, edge_seg):.0f} µm)', edge_seg, edge_v, '#1baf7a')]
     return plot_interactive_dashboard(
         t, rgc['all'], sites=sites, panels=[('Vm', [s[0] for s in sites])],
         seg_recorders=rgc['segs'], view_um=zoom_um, view_centre=centre, mark_soma=True,
+        electrode=_electrode_xyz(res),
         t_window=(t[i_soma] - before_peak, t[i_soma] + after_peak),
         frame_ms=frame_ms, frame_delay=frame_delay, colour_gamma=colour_gamma,
-        protocol=[('IClamp', res['delay'], res['delay'] + res['dur'], 'orange')], panel_height=380,
+        protocol=[(_stim(res)[1], res['delay'], res['delay'] + res['dur'], 'orange')], panel_height=380,
         title=f"Soma and AIS, played {frame_delay / frame_ms:,.0f}× slower than real time", save_html=save_html)
 
 
@@ -905,18 +948,18 @@ def conduction_velocity(res):
 
 def show_axon_conduction(res):
     """Activity 5: the standard figure with Vm along the axon, and the conduction velocity between
-    0.7 mm and 2.8 mm along the axon (with the √diameter prediction from the 1 µm axon, once that has run)."""
+    1 mm and 4 mm from the soma (with the √diameter prediction from the 1 µm axon, once that has run)."""
     t, col, g = res['t'], res['rgc']['colours'], res['rgc']['gates']
     diam = res['axon_diam'] if res['axon_diam'] is not None else AXON_DIAM_DEFAULT
     plot_hh_panels(t, res['i'], [('Soma', res['soma'], col['Soma']), ('AIS', res['ais'], col['AIS'])],
                    g['m'], g['h'], g['n'], h.soma(0.5).gnabar_spike, h.soma(0.5).gkbar_spike,
                    extra_panels=[('Axon Vm (mV)', [('Soma', res['soma'], '#bbbbbb')]
                                   + [(l, v, col[l]) for l, v in res['axon'].items()])],
-                   title=f"Axon diameter {diam} µm: {res['amp']} pA for {res['dur']} ms into the soma")
-    (l1, s1, d1), (l2, s2, d2) = res['rgc']['axon_sites'][:2]
+                   title=f"Axon diameter {diam} µm: {_stim(res)[2]}", stim_label=_stim(res)[0])
+    (l1, _, d1), (l2, _, d2) = res['rgc']['axon_sites'][0], res['rgc']['axon_sites'][3]   # 1 mm and 4 mm
     i1, i2 = _first_peak(t, res['axon'][l1]), _first_peak(t, res['axon'][l2])
     if i1 is None or i2 is None:
-        print(f"Axon diameter {diam} µm: the spike did not reach 2.8 mm along the axon")
+        print(f"Axon diameter {diam} µm: the spike did not reach 4 mm along the axon")
         return
     cv = (d2 - d1) / (t[i2] - t[i1]) / 1000                    # µm/ms -> m/s
     print(f"Axon diameter {diam} µm: conduction velocity {cv:.2f} m/s")
